@@ -1,0 +1,38 @@
+# configs/scale_benchmark.yaml
+# Reproduces the N0 = 10k / 100k / 1M scale-invariance figure.
+# The alpha(t) part is CPU-only and cheap at every scale (no documents,
+# embeddings, or FAISS index are built). Only `run_qa_validation.py`
+# (separate script, optional) needs GPU/network, and only up to the scale
+# your Colab tier can realistically support -- see README.md.
+
+lambda_fixed: 0.007        # q/N0 held fixed across all scales
+N0_list: [10000, 100000, 1000000]
+seed_counts: {10000: 10, 100000: 5, 1000000: 3}
+alpha0: 0.0
+mu_multiplier: 1.15
+output_dir: results/scale_benchmark
+
+# --- Settings for the OPTIONAL QA/FAISS validation (run_qa_validation.py) ---
+qa_validation:
+  enabled: false             # flip to true only if you intend to run it
+  index_type_by_scale:
+    10000: flat
+    100000: ivfflat
+    1000000: ivfpq
+  ivf_nlist: 4096
+  pq_m: 64
+  pq_nbits: 8
+  generation_mode_by_scale:      # item D: proxy generation for large scales
+    10000: real
+    100000: real
+    1000000: proxy                # duplicate/perturb embeddings instead of
+                                    # generating 1M unique documents
+  proxy_unique_docs: 10000         # number of genuinely unique synthetic
+                                    # docs generated before duplication
+  checkpoints_fraction: [0.0, 0.25, 0.5, 0.75, 1.0]
+  eval_model: "google/flan-t5-large"   # separate from the generator model
+                                          # (item A: avoid self-eval confound)
+  generator_model: "google/flan-t5-base"
+  ivfpq_vs_flat_control:
+    enabled: true              # item C: sanity-check IVFPQ against Flat at 100k
+    tolerance_pct: 5.0

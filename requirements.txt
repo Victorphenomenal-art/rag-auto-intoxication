@@ -1,0 +1,27 @@
+# --- Core (CPU-only, needed for src/analytical.py, src/simulator.py,
+#     src/eviction.py, tests/, and both run_phase_transition.py /
+#     run_scale_benchmark.py). Installs in seconds even on free Colab. ---
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.7
+pandas>=2.0
+pyyaml>=6.0
+pytest>=7.0
+
+# --- Optional (only needed for scripts/run_qa_validation.py). Requires
+#     network access for model/dataset downloads and, for anything past
+#     N0=10k, a GPU. NOT installed by default -- see README.md for
+#     per-scale feasibility on free vs Pro Colab before installing these. ---
+# torch>=2.0
+# transformers>=4.30
+# datasets>=2.14
+# sentence-transformers>=2.2
+# faiss-cpu>=1.7          # NOTE: use faiss-cpu, not faiss-gpu -- the pip
+#                          # faiss-gpu wheel is unofficial/unmaintained and
+#                          # frequently breaks on Colab's CUDA version.
+#                          # faiss-cpu is slower but reliable; IVFPQ still
+#                          # works fine on CPU for the checkpoint-only
+#                          # evaluation pattern this repo uses.
+# accelerate>=0.20
+# bitsandbytes>=0.41       # only needed if you swap in a 4-bit model
+#                          # (e.g. Mistral-7B-Instruct) for eval_model

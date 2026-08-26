@@ -1,0 +1,11 @@
+# configs/phase_transition.yaml
+# Reproduces the N0 = 23 / 100 / 1000 phase-transition figure.
+# CPU-only, runs in seconds. No GPU/network required.
+
+N0_list: [23, 100, 1000]
+q: 7
+alpha0: 0.0
+seeds: 20
+mu_multipliers: [0.85, 1.0, 1.15]   # relative to mu_critical = 2q/N0
+max_iter_margin: 1.1                 # buffer above T(alpha=0.9) from Eq 3
+output_dir: results/phase_transition
