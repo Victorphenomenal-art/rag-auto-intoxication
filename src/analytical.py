@@ -82,6 +82,17 @@ def mu_bifurcation(q, N0):
     stabilized alpha* crosses the 0.5 operational threshold, not where
     the qualitative dynamics change."""
     return q / N0
+def mu_bifurcation(q, N0):
+    """The actual dynamical bifurcation point (q/N0)"""
+    return q / N0
+
+def mu_safe(q, N0):
+    """Eq (10): operational safety threshold (2q/N0)"""
+    return 2 * q / N0
+
+# Backwards-compatible alias (MUST COME AFTER mu_safe is defined)
+mu_critical = mu_safe
+
 
 
 def alpha_star(q, N0, mu):
