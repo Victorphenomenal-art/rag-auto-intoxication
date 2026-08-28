@@ -67,8 +67,9 @@ class CountSimulator:
                 else:
                     matured_q = q_t
                 # growth uses this step's actual influx; eviction acts only on matured mass
-                dalpha_growth = (q_t / self.N0) * (1 - alpha)
-                dalpha_evict = self.mu * alpha * (1 - alpha) * (matured_q > 0 or self.detection_delay == 0)
+                dalpha_growth = (matured_q / self.N0) * (1 - alpha)  # use matured_q, not q_t
+                dalpha_evict = self.mu * alpha * (1 - alpha)          # unconditional
+
                 dalpha = dalpha_growth - dalpha_evict
                 alpha = float(np.clip(alpha + dalpha, 0.0, 1.0))
                 history[t] = alpha
