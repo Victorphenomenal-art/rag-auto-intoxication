@@ -8,9 +8,8 @@ corpus (Eqs. 1-12).
 
 - **Eq (3)** exact transient solution for the uncorrected (growing) corpus.
 - **Eq (8)** exact closed-form solution for the corrected (chemostat) system
-  — verified against `scipy.integrate.odeint` to <1e-6 in `tests/`.
-- **Eq (10)** phase transition at `mu = 2q/N0`: below it, alpha drifts to 1;
-  above it, alpha stabilizes at `alpha* = q/(mu*N0)` (Eq 9).
+  verified against `scipy.integrate.odeint` to <1e-6 in `tests/`.
+- **Eq (10)** phase transition at `mu = 2q/N0`: below it, Below mu_bifurcation = q/N0, alpha drifts to 1 (no stable interior fixed point exists). Above it, alpha stabilizes at alpha* = q/(mu*N0) but that value only satisfies the operational safety target alpha* < 0.5 once mu > mu_safe = 2q/N0. Between q/N0 and 2q/N0, the system is dynamically stable but still fails the 0.5 threshold. (Eq 9).
 - **Scale invariance**: holding `lambda = q/N0` fixed, the dynamics for
   N0 = 10k / 100k / 1M are *identical* — this repo demonstrates that
   without needing to store a single document string at those scales.
