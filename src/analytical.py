@@ -76,9 +76,12 @@ def alpha_corrected_ode_rhs(alpha, t, q, N0, mu):
     return (q / N0) * (1 - alpha) - mu * alpha * (1 - alpha)
 
 
-def mu_critical(q, N0):
-    """Eq (10): minimum eviction rate for stability (safety threshold)."""
-    return 2 * q / N0
+def mu_bifurcation(q, N0):
+    """The actual dynamical bifurcation point (q/N0). Below this, the only
+    fixed point in [0,1] is alpha=1. mu_safe (2q/N0) is where the
+    stabilized alpha* crosses the 0.5 operational threshold, not where
+    the qualitative dynamics change."""
+    return q / N0
 
 
 def alpha_star(q, N0, mu):
