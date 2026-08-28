@@ -34,5 +34,6 @@ qa_validation:
                                           # (item A: avoid self-eval confound)
   generator_model: "google/flan-t5-base"
   ivfpq_vs_flat_control:
-    enabled: true              # item C: sanity-check IVFPQ against Flat at 100k
-    tolerance_pct: 5.0
+  enabled: true
+  run_at_N0: 100000           # <-- ADD THIS LINE
+  tolerance_pct: 5.0
