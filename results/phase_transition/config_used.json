@@ -1,0 +1,17 @@
+{
+  "N0_list": [
+    23,
+    100,
+    1000
+  ],
+  "q": 7,
+  "alpha0": 0.0,
+  "seeds": 20,
+  "mu_multipliers": [
+    0.85,
+    1.0,
+    1.15
+  ],
+  "max_iter_margin": 1.1,
+  "output_dir": "results/phase_transition"
+}

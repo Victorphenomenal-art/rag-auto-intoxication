@@ -1,0 +1,46 @@
+{
+  "lambda_fixed": 0.007,
+  "N0_list": [
+    10000,
+    100000,
+    1000000
+  ],
+  "seed_counts": {
+    "10000": 10,
+    "100000": 5,
+    "1000000": 3
+  },
+  "alpha0": 0.0,
+  "mu_multiplier": 1.15,
+  "output_dir": "results/scale_benchmark",
+  "qa_validation": {
+    "enabled": false,
+    "index_type_by_scale": {
+      "10000": "flat",
+      "100000": "ivfflat",
+      "1000000": "ivfpq"
+    },
+    "ivf_nlist": 4096,
+    "pq_m": 64,
+    "pq_nbits": 8,
+    "generation_mode_by_scale": {
+      "10000": "real",
+      "100000": "real",
+      "1000000": "proxy"
+    },
+    "proxy_unique_docs": 10000,
+    "checkpoints_fraction": [
+      0.0,
+      0.25,
+      0.5,
+      0.75,
+      1.0
+    ],
+    "eval_model": "google/flan-t5-large",
+    "generator_model": "google/flan-t5-base",
+    "ivfpq_vs_flat_control": {
+      "enabled": true,
+      "tolerance_pct": 5.0
+    }
+  }
+}
