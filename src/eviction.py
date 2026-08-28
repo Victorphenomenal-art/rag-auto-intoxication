@@ -95,8 +95,11 @@ class ProvenanceEviction(EvictionPolicy):
 
     def select_for_eviction(self, docs, current_iter, detection_delay=0):
         eligible = self._eligible_indices(docs, current_iter, detection_delay)
-        flagged = [i for i in eligible if self._weight(docs[i].generation) < self.weight_threshold]
-        if not flagged:
-            return []
-        n_cap = int(round(self.max_rate * len(eligible)))
-        return flagged[:n_cap] if n_cap > 0 else []
+        flagged = sorted(
+    (i for i in eligible if self._weight(docs[i].generation) < self.weight_threshold),
+    key=lambda i: self._weight(docs[i].generation)
+)
+       if not flagged:
+          return []
+      n_cap = int(round(self.max_rate * len(eligible)))
+      return flagged[:n_cap] if n_cap > 0 else []
