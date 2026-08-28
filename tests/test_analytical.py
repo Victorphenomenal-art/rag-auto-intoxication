@@ -77,7 +77,14 @@ def test_mu_critical_boundary_behavior():
     assert abs(alpha_star(q, N0, mu_c) - 0.5) < 1e-9
     assert alpha_star(q, N0, mu_c * 1.5) < 0.5
     assert alpha_star(q, N0, mu_c * 0.5) > 0.5
-
+    
+def test_intermediate_band_stabilizes_not_collapses():
+    q, N0 = 7.0, 1000.0
+    lam = q / N0
+    mu = 1.5 * lam   # strictly between bifurcation (lam) and mu_safe (2*lam)
+    a_inf = alpha_corrected_exact(1e5, q, N0, mu, alpha0=0.0)
+    assert a_inf < 0.999   # stabilizes, does not drift to 1
+    assert a_inf > 0.5     # but still fails the safety threshold
 
 def test_scale_invariance_under_fixed_lambda():
     # Core claim used in the scale-up experiments: holding lambda = q/N0
