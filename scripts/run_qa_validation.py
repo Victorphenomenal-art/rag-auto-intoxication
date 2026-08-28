@@ -83,7 +83,9 @@ def run_for_scale(N0, cfg, smoke_test=False):
         print(f"  N0={N0} alpha~{frac:.2f} index={index_type} gen={gen_mode}  EM={em:.3f} F1={f1:.3f}")
 
     # Item C: Flat vs IVFPQ control check
-    if qa_cfg["ivfpq_vs_flat_control"]["enabled"] and index_type != "flat" and not smoke_test:
+    control_cfg = qa_cfg["ivfpq_vs_flat_control"]
+    control_scale = control_cfg.get("run_at_N0", 100_000)  # add this key to the yaml
+    if control_cfg["enabled"] and index_type != "flat" and not smoke_test and N0 == control_scale:
         print(f"  Running Flat-vs-{index_type} control check at N0={N0}...")
         docs = build_kb_at_checkpoint(n_human, 0.5, base_docs, unique_synth)
         em_a, f1_a = evaluator.evaluate_kb(docs, index_type="flat")
