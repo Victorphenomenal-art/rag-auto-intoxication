@@ -2,7 +2,7 @@
 """
 scripts/run_operational_validation.py
 =======================================
-Victor's Operational Validation (Research-Grade)
+Victor's Operational Validation 
 
 This script addresses the "real-world gap" between continuous ODE theory
 and discrete document-level eviction policies. It reveals two key insights:
@@ -26,7 +26,7 @@ import matplotlib.pyplot as plt
 from scipy.optimize import bisect
 
 from src.simulator import DocumentLevelSimulator
-from src.eviction import RandomEviction, ProvenanceEviction, EvictionPolicy
+from src.eviction import RandomEviction, ProvenanceEviction, EvictionPolicy, Document
 from src.analytical import mu_safe, alpha_star, alpha_corrected_exact, mu_bifurcation
 
 # -------------------------------------------------------------------
