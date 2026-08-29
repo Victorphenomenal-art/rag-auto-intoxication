@@ -3,15 +3,7 @@
 scripts/run_scale_benchmark.py
 ===============================
 Reproduces the N0 = 10k / 100k / 1M scale-invariance figure using
-configs/scale_benchmark.yaml. This is the alpha(t)-only part -- CPU-only,
-runs in well under a minute total, including N0=1,000,000, because no
-document text/embeddings/index are needed to compute alpha(t) (see
-src/analytical.py and src/simulator.py).
-
-The QA/FAISS validation (real retrieval + generation) is a SEPARATE,
-optional script -- run_qa_validation.py -- gated behind
-qa_validation.enabled in the config, since it needs network + ideally GPU.
-This script does not call it.
+configs/scale_benchmark.yaml. CPU-only, runs in under a minute.
 
 Usage:
     python scripts/run_scale_benchmark.py [--config configs/scale_benchmark.yaml]
@@ -29,7 +21,7 @@ import yaml
 from scipy.stats import ttest_1samp
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.analytical import alpha_uncorrected, alpha_corrected_exact, mu_critical, alpha_star, half_life_exact
+from src.analytical import alpha_uncorrected, alpha_corrected_exact, mu_bifurcation, mu_safe, alpha_star, half_life_exact
 from src.simulator import run_multi_seed
 
 
@@ -54,8 +46,9 @@ def main(config_path):
 
     for N0 in N0_list:
         q = lam * N0
-        mu_c = mu_critical(q, N0)
-        mu_used = mu_mult * mu_c
+        mu_b = mu_bifurcation(q, N0)
+        mu_s = mu_safe(q, N0)
+        mu_used = mu_mult * mu_s
         n_seeds = seed_counts[N0]
 
         alpha_base_exact = alpha_uncorrected(iters, q, N0, alpha0)
@@ -76,14 +69,15 @@ def main(config_path):
         else:
             t_stat, p_val = np.nan, np.nan
 
-        results[N0] = dict(q=q, mu_c=mu_c, mu_used=mu_used, n_seeds=n_seeds,
+        results[N0] = dict(q=q, mu_bifurcation=mu_b, mu_safe=mu_s, mu_used=mu_used, n_seeds=n_seeds,
                             alpha_base_exact=alpha_base_exact, alpha_corr_exact=alpha_corr_exact,
                             mean_base=mean_base, std_base=std_base,
                             mean_corr=mean_corr, std_corr=std_corr)
 
         summary_rows.append({
             "N0": N0, "lambda": lam, "q": q, "n_seeds": n_seeds,
-            "mu_critical": mu_c, "mu_used": mu_used,
+            "mu_bifurcation": mu_b, "mu_safe": mu_s, "mu_used": mu_used,
+            "dynamically_stable": mu_used > mu_b,
             "half_life_iters": thalf, "alpha_star_theory": astar,
             "alpha_corrected_stoch_mean_final": mean_corr[-1],
             "alpha_corrected_stoch_std_final": std_corr[-1],
