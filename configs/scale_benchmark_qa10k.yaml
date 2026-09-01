@@ -1,0 +1,35 @@
+N0_list:
+- 10000
+alpha0: 0.0
+lambda_fixed: 0.007
+mu_multiplier: 1.15
+output_dir: results/scale_benchmark
+qa_validation:
+  checkpoints_fraction:
+  - 0.0
+  - 0.25
+  - 0.5
+  - 0.75
+  - 1.0
+  enabled: true
+  eval_model: google/flan-t5-small
+  generation_mode_by_scale:
+    10000: real
+    100000: real
+    1000000: proxy
+  generator_model: google/flan-t5-base
+  index_type_by_scale:
+    10000: flat
+    100000: ivfflat
+    1000000: ivfpq
+  ivf_nlist: 4096
+  ivfpq_vs_flat_control: null
+  pq_m: 64
+  pq_nbits: 8
+  proxy_unique_docs: 10000
+  run_at_N0: 100000
+  tolerance_pct: 5.0
+seed_counts:
+  10000: 10
+  100000: 5
+  1000000: 3

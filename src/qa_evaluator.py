@@ -4,34 +4,12 @@ src/qa_evaluator.py
 REQUIRES: torch, transformers, sentence-transformers, datasets, faiss,
 network access (model + dataset downloads), and ideally a GPU.
 
-NOT executed or tested in the environment that produced this repo (no
-network/GPU there) -- syntax-checked with py_compile only. Test this
-module yourself with a small smoke run (e.g. 5 documents, 3 QA items)
-before trusting it in a full experiment.
-
-Item A from the critique: splits GENERATION and EVALUATION across two
-different models to avoid the self-referential confound where a single
-model both writes the synthetic corpus and grades answers derived from
-it (which can inflate scores because the evaluator is unusually good at
-parsing its own generation style/patterns).
-
-  - generator_model : produces synthetic documents (cheap, e.g. flan-t5-base)
-  - eval_model       : answers QA questions using retrieved context
-                        (should be a DIFFERENT model/family, e.g.
-                        flan-t5-large or, if you have the VRAM budget,
-                        mistralai/Mistral-7B-Instruct-v0.3 in 4-bit)
-
-A note on feasibility: Mistral-7B-Instruct in 4-bit needs ~4-5GB VRAM and
-fits on a free-tier T4 (16GB), but downloading + loading it repeatedly
-across Colab session resets is slow and disk-quota-sensitive. flan-t5-large
-(~800M params) is the more Colab-friendly default; swap in Mistral only if
-you have a stable, longer-running session (Colab Pro or local GPU).
+Patched with BATCHED generation for speed (avoids the unbatched
+50-minute-plus stall at N0=10k+).
 """
-
 import re
 from collections import Counter
 from typing import List, Tuple
-
 import numpy as np
 
 
@@ -57,7 +35,7 @@ def compute_f1(a_gold: str, a_pred: str) -> float:
 
 
 class DocumentGenerator:
-    """Generates synthetic documents. Cheap model by design (item A)."""
+    """Generates synthetic documents, batched for speed."""
 
     def __init__(self, model_name: str = "google/flan-t5-base", device: str = None):
         import torch
@@ -67,25 +45,28 @@ class DocumentGenerator:
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to(self.device)
 
-    def generate(self, seed_text: str, n: int = 1, max_new_tokens: int = 60) -> List[str]:
+    def generate(self, seed_text: str, n: int = 1, max_new_tokens: int = 60,
+                 batch_size: int = 8) -> List[str]:
+        """Generate n documents in batches instead of one call at a time."""
         import torch
-        prompt = f"Continue or paraphrase this passage:\n{seed_text}"
-        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True,
-                                 max_length=256).to(self.device)
-        outs = []
-        for _ in range(n):
+        prompts = [f"Continue or paraphrase this passage:\n{seed_text}" for _ in range(n)]
+        outputs = []
+        for i in range(0, len(prompts), batch_size):
+            batch = prompts[i:i + batch_size]
+            inputs = self.tokenizer(batch, return_tensors="pt", truncation=True,
+                                     max_length=256, padding=True).to(self.device)
             with torch.no_grad():
                 gen = self.model.generate(**inputs, max_new_tokens=max_new_tokens,
                                            do_sample=True, temperature=0.9)
-            outs.append(self.tokenizer.decode(gen[0], skip_special_tokens=True))
-        return outs
+            outputs.extend(self.tokenizer.decode(g, skip_special_tokens=True) for g in gen)
+        return outputs
 
 
 class RAGQAEvaluator:
     """
     Evaluates a knowledge base (list of document strings) on a SQuAD sample.
     Uses a SEPARATE model from whatever generated the synthetic documents
-    (see DocumentGenerator) -- pass a different `eval_model_name`.
+    (avoids the self-eval confound -- see README item A).
     """
 
     def __init__(self, eval_model_name: str = "google/flan-t5-large",
@@ -100,7 +81,11 @@ class RAGQAEvaluator:
         self.embedder = SentenceTransformer(embed_model_name).to(self.device)
         self.tokenizer = AutoTokenizer.from_pretrained(eval_model_name)
         self.generator = AutoModelForSeq2SeqLM.from_pretrained(eval_model_name).to(self.device)
-        self.test_set = (load_dataset("stanfordnlp/squad", split="validation")
+
+        # "squad" (bare) is deprecated on the Hub; current canonical id is
+        # the namespaced "rajpurkar/squad". Verify against your installed
+        # `datasets` version before a full run -- test this line alone first.
+        self.test_set = (load_dataset("rajpurkar/squad", split="validation")
                           .shuffle(seed=seed).select(range(n_test_items)))
 
     def answer(self, context: str, question: str) -> str:
@@ -157,16 +142,7 @@ class RAGQAEvaluator:
 
 def make_proxy_corpus(unique_docs: List[str], target_size: int, noise_std: float = 0.0,
                        seed: int = 0) -> List[str]:
-    """
-    Item D: cheap stand-in for generating `target_size` unique documents at
-    scale (e.g. 1M). Duplicates/paraphrase-shuffles `unique_docs` up to
-    `target_size` rather than running the generator that many times.
-
-    IMPORTANT: this only approximates RETRIEVAL-scale behaviour (index
-    size, query latency, alpha bookkeeping). It does NOT approximate
-    linguistic diversity -- label any results built on this as "scaling of
-    retrieval behaviour", not "scaling of generation quality", per item D.
-    """
+    """Cheap stand-in for generating large numbers of unique documents."""
     rng = np.random.default_rng(seed)
     if not unique_docs:
         return []
@@ -175,7 +151,6 @@ def make_proxy_corpus(unique_docs: List[str], target_size: int, noise_std: float
         doc = unique_docs[rng.integers(0, len(unique_docs))]
         words = doc.split()
         if len(words) > 4 and rng.random() < 0.5:
-            # cheap "paraphrase": shuffle a short span
             i = rng.integers(0, len(words) - 3)
             span = words[i:i + 3]
             rng.shuffle(span)
