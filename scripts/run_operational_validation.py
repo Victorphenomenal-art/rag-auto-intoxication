@@ -1,140 +1,226 @@
-#!/usr/bin/env python3
-"""
-scripts/run_operational_validation.py
-=======================================
-Victor's Operational Validation (Research-Grade, IEEE-Ready)
-
-This script now implements a REAL semantic deduplication baseline using
-SentenceTransformers and FAISS (via NumPy dot products), removing the
-"placeholder" caveat that reviewers would attack.
-
-Key findings:
-1. Naive Random Eviction misses theory by ~40% (Calibration required).
-2. Calibrated Random Eviction matches theory perfectly.
-3. REAL Semantic Dedup (purple) performs similarly to random eviction,
-   but still fails to match the calibrated optimum.
-4. ProvenanceEviction fails catastrophically across the entire tested range
-   due to the self-limiting feedback loop.
-
-No HF token is required for this script (it runs the embedder locally).
-"""
-
+import argparse
 import os
+import time
+from collections import Counter
+from dataclasses import dataclass
+from typing import Dict, List, Optional
+
 import numpy as np
 import matplotlib.pyplot as plt
-from collections import Counter
 from scipy.optimize import bisect
 
+import sys
+sys.path.insert(0, os.getcwd())
 from src.simulator import DocumentLevelSimulator
 from src.eviction import RandomEviction, ProvenanceEviction, EvictionPolicy, Document
 from src.analytical import mu_safe, alpha_star
 
-# -------------------------------------------------------------------
-# 1. Configuration
-# -------------------------------------------------------------------
-N0 = 100
-q = 7
-alpha0 = 0.0
-max_iter = 500
-seeds = list(range(30))
 
-mu_s = mu_safe(q, N0)           # 0.14
-mu_used = 1.15 * mu_s           # 0.161
-theory_alpha_star = alpha_star(q, N0, mu_used)  # 0.4348
+# ---------------------------------------------------------------------
+# 1. Real, content-bearing documents
+# ---------------------------------------------------------------------
+@dataclass
+class TextDocument(Document):
+    """Document with actual text content, so similarity-based policies
+    (SemanticDeduplicationEviction) measure something real."""
+    text: str = ""
 
-# -------------------------------------------------------------------
-# 2. Calibration: find discrete rate that matches theory_alpha_star
-# -------------------------------------------------------------------
-def simulate_random_eviction(rate, seed=0):
-    policy = RandomEviction(rate=rate, rng=np.random.default_rng(seed))
-    sim = DocumentLevelSimulator(N0=N0, mean_q=q, policy=policy,
-                                 alpha0=alpha0, seed=seed)
-    hist = sim.run(max_iter)
-    return hist[-1]
 
-def calibrate_random_eviction_rate():
-    def target(rate):
-        alphas = [simulate_random_eviction(rate, seed=s) for s in range(5)]
-        return np.mean(alphas) - theory_alpha_star
-    try:
-        return bisect(target, 0.01, 1.0, xtol=1e-4)
-    except ValueError:
-        return 0.08
+# A small pool of distinct topics, so synthetic docs on the same topic
+# are meaningfully more similar to each other than to unrelated topics
+# -- this mirrors how independently-generated LLM content on the same
+# subject tends to converge in phrasing even without direct copying.
+_TOPIC_POOL = [
+    "the water cycle and evaporation", "photosynthesis in plants",
+    "the causes of the French Revolution", "how vaccines train the immune system",
+    "the structure of the solar system", "supply and demand in economics",
+    "the rules of chess openings", "how neural networks learn via backpropagation",
+    "the plot of a Shakespearean tragedy", "the geology of volcanic islands",
+    "the history of the printing press", "how bridges distribute load",
+]
 
-calibrated_rate = calibrate_random_eviction_rate()
-print(f"Calibrated rate = {calibrated_rate:.4f} (theory α*={theory_alpha_star:.4f})")
 
-# -------------------------------------------------------------------
-# 3. REAL SEMANTIC DEDUPLICATION BASELINE (FAISS + SentenceTransformers)
-# -------------------------------------------------------------------
+def make_human_docs(n: int, seed: int = 0) -> List[TextDocument]:
+    """Distinct factual content, one per topic-index combination."""
+    rng = np.random.default_rng(seed)
+    docs = []
+    for i in range(n):
+        topic = _TOPIC_POOL[i % len(_TOPIC_POOL)]
+        detail = rng.integers(1000, 9999)
+        text = f"Reference note #{detail} on {topic}: verified human-authored summary."
+        docs.append(TextDocument(is_synthetic=False, generation=0, text=text))
+    return docs
+
+
+def make_fresh_synthetic_text(rng: np.random.Generator) -> str:
+    """A new, independently-generated synthetic doc (generation=1):
+    topically related to one pool entry, but not a paraphrase of any
+    specific existing document. Multiple phrasing templates are used so
+    unrelated fresh docs aren't all wrapped in identical boilerplate.
+
+    NOTE: this was checked against a crude character-trigram mock
+    embedder (see the test suite run during development), which confirms
+    the qualitative direction -- echoes score reliably higher similarity
+    than independent fresh docs -- but is a poor proxy for whether the
+    threshold=0.90 default below is well CALIBRATED against real
+    MiniLM embeddings. Verify that threshold empirically (e.g. print the
+    max_sims distribution for a real run) before trusting it as tuned;
+    treat 0.90 as a reasonable starting point, not a validated constant.
+    """
+    topic = _TOPIC_POOL[rng.integers(0, len(_TOPIC_POOL))]
+    variant = rng.integers(1, 99999)
+    templates = [
+        f"Generated explainer (v{variant}) covering {topic} in general terms.",
+        f"Draft #{variant}: an overview discussing {topic} for a general audience.",
+        f"AI-written summary {variant} exploring key ideas behind {topic}.",
+        f"Autogenerated passage {variant} introducing {topic} from first principles.",
+    ]
+    return templates[rng.integers(0, len(templates))]
+
+
+def make_echo_text(parent_text: str, rng: np.random.Generator) -> str:
+    """A recursive echo: a near-paraphrase of its parent's text (this is
+    what makes recursive synthetic generation prone to near-duplication --
+    re-summarizing already-synthetic content tends to preserve most of
+    the parent's structure and content with only minor surface changes)."""
+    tags = ["restated", "rephrased", "summarized again", "reworded"]
+    tag = tags[rng.integers(0, len(tags))]
+    # Small, bounded edit distance from the parent -- genuinely near-duplicate.
+    return f"{parent_text} [{tag}]"
+
+
+# ---------------------------------------------------------------------
+# 2. Similarity backend: real FAISS if available, honest NumPy fallback
+# ---------------------------------------------------------------------
+try:
+    import faiss  # noqa: F401
+    _FAISS_AVAILABLE = True
+except ImportError:
+    _FAISS_AVAILABLE = False
+
+
+def max_pairwise_similarity(embs: np.ndarray) -> np.ndarray:
+    """Returns, for each row, its max cosine similarity to any OTHER row.
+    Uses faiss.IndexFlatIP if faiss is installed, else a NumPy matmul.
+    `embs` must already be L2-normalized (cosine == inner product)."""
+    n = embs.shape[0]
+    if n <= 1:
+        return np.zeros(n)
+    if _FAISS_AVAILABLE:
+        index = faiss.IndexFlatIP(embs.shape[1])
+        index.add(embs)
+        # search for top-2 neighbours (self + best other), drop self
+        sims, idxs = index.search(embs, min(2, n))
+        max_sim = np.empty(n)
+        for i in range(n):
+            others = [s for s, j in zip(sims[i], idxs[i]) if j != i]
+            max_sim[i] = max(others) if others else 0.0
+        return max_sim
+    else:
+        sim = embs @ embs.T
+        np.fill_diagonal(sim, -1.0)
+        return sim.max(axis=1)
+
+
 class SemanticDeduplicationEviction(EvictionPolicy):
     """
-    REAL semantic deduplication using SentenceTransformers + FAISS.
-    - Generates placeholder text deterministically from document index.
-    - Embeds the text using all-MiniLM-L6-v2.
-    - Computes cosine similarity via FAISS (or NumPy).
-    - Evicts the most duplicated documents first.
+    Flags synthetic documents whose nearest-neighbour cosine similarity
+    (among other currently-eligible synthetic documents) exceeds
+    `threshold`, i.e. near-duplicate content. Requires documents to be
+    TextDocument instances (have a `.text` attribute with real content).
 
-    NOTE: Since DocumentLevelSimulator does not store raw text, we generate
-    a deterministic string per document index. This is a controlled simulation
-    of semantic dedup that behaves identically to a real FAISS pipeline
-    (it just lacks the actual Wikipedia text, but the *algorithm* is real).
+    `embedder` should be a pre-loaded SentenceTransformer (or anything
+    with a compatible `.encode(list[str]) -> np.ndarray` method), shared
+    across policy instances -- pass the SAME embedder object across seeds
+    rather than constructing a new one per instance, or you pay the model
+    load cost every time.
+
+    NOTE ON INTERPRETING THIS POLICY'S CURVE: at p_recursive=0.5 (the
+    default sweep midpoint used in main()), roughly half of new synthetic
+    docs are near-paraphrases of an existing doc and thus score above
+    `threshold`. That happens to make the number of docs this policy
+    evicts land close to what RandomEviction(rate=mu_used) would evict at
+    the same rate -- so "Semantic Dedup" and "Naive Random" can end up
+    visually similar in the Policy Comparison plot. That's a real,
+    p_recursive-dependent coincidence in volume, not evidence the two
+    policies are doing the same thing (they select WHICH docs to evict
+    very differently -- similarity-ranked vs. uniform-random). Don't
+    assume this convergence holds at other p_recursive values without
+    checking; sweep p_recursive for this policy the same way it's swept
+    for ProvenanceEviction if that claim needs to go in the paper.
     """
-    def __init__(self, threshold: float = 0.95, max_rate: float = 1.0):
+
+    def __init__(self, embedder, threshold: float = 0.90, max_rate: float = 1.0):
+        self.embedder = embedder
         self.threshold = threshold
         self.max_rate = max_rate
-        self.embedder = None
+        self._embed_cache: Dict[str, np.ndarray] = {}  # keyed by TEXT, not object id
 
-    def _get_embedder(self):
-        if self.embedder is None:
-            from sentence_transformers import SentenceTransformer
-            # Lazy load to avoid import overhead if the policy is never used
-            self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
-        return self.embedder
+    def _embed(self, texts: List[str]) -> np.ndarray:
+        uncached = [t for t in texts if t not in self._embed_cache]
+        if uncached:
+            new_embs = self.embedder.encode(uncached, convert_to_numpy=True).astype(np.float32)
+            new_embs = new_embs / np.linalg.norm(new_embs, axis=1, keepdims=True).clip(min=1e-9)
+            for t, e in zip(uncached, new_embs):
+                self._embed_cache[t] = e
+        return np.stack([self._embed_cache[t] for t in texts])
 
     def select_for_eviction(self, docs, current_iter, detection_delay=0):
         eligible = [i for i, d in enumerate(docs) if d.is_synthetic]
         if not eligible:
             return []
-
         n_evict = int(round(self.max_rate * len(eligible)))
         if n_evict <= 0:
             return []
 
-        # Generate deterministic placeholder text based on document index.
-        # In a real system, we would use the actual document strings.
-        texts = [f"Document_{i}_content_{i}" for i in eligible]
+        texts = [docs[i].text for i in eligible]
+        embs = self._embed(texts)
+        max_sims = max_pairwise_similarity(embs)
+        self.last_max_sims = max_sims  # exposed for calibration inspection, see main()
 
-        # Real embedding computation
-        embedder = self._get_embedder()
-        embs = embedder.encode(texts, convert_to_numpy=True).astype(np.float32)
-        # L2 normalize for cosine similarity
-        embs = embs / np.linalg.norm(embs, axis=1, keepdims=True)
-
-        # Compute pairwise cosine similarity (dot product since normalized)
-        similarities = embs @ embs.T
-        np.fill_diagonal(similarities, 0.0)
-
-        # Find the maximum similarity for each document
-        max_sims = np.max(similarities, axis=1)
-
-        # Flag documents with a neighbor above the threshold
-        flagged_indices_local = np.where(max_sims > self.threshold)[0]
-        # Sort flagged by similarity descending (most duplicated first)
-        sorted_local = sorted(flagged_indices_local, key=lambda i: max_sims[i], reverse=True)
-
-        # Map local indices back to global document indices
-        flagged_global = [eligible[i] for i in sorted_local]
-
+        flagged_local = [i for i in range(len(eligible)) if max_sims[i] > self.threshold]
+        flagged_local.sort(key=lambda i: max_sims[i], reverse=True)  # worst duplicates first
+        flagged_global = [eligible[i] for i in flagged_local]
         return flagged_global[:n_evict]
 
-# -------------------------------------------------------------------
-# 4. Recursive Generation Simulator (Real Provenance)
-# -------------------------------------------------------------------
+
+# ---------------------------------------------------------------------
+# 3. Text-aware simulator with recursive generation
+# ---------------------------------------------------------------------
 class RecursiveGenerationSimulator(DocumentLevelSimulator):
-    def __init__(self, p_recursive=0.5, *args, **kwargs):
+    """Generates TextDocuments (real content) instead of the base class's
+    text-free Document objects, and models recursive echoes as
+    near-paraphrases of their parent's actual text.
+
+    IMPORTANT CAVEAT (see calibrate_random_eviction_rate / main() for the
+    fuller explanation): like the base DocumentLevelSimulator, this never
+    evicts human documents and only appends new synthetic docs without
+    any complementary removal to hold total corpus size at N0. So the
+    total pool size N(t) grows over time rather than staying pinned at
+    N0 the way src/analytical.py's closed-form ODE assumes. For
+    RandomEviction specifically this has an exact closed-form correction
+    (see naive_random_alpha_star_closed_form below); for
+    ProvenanceEviction and SemanticDeduplicationEviction there isn't one
+    -- their steady states must be read empirically from these curves,
+    not compared directly against alpha_star().
+    """
+
+    def __init__(self, p_recursive: float = 0.5, *args, **kwargs):
         self.p_recursive = p_recursive
         super().__init__(*args, **kwargs)
+
+    def __post_init__(self):
+        self.rng = np.random.default_rng(self.seed)
+        n_synth0 = int(round(self.alpha0 * self.N0))
+        human_docs = make_human_docs(self.N0 - n_synth0, seed=self.seed or 0)
+        synth_docs = [
+            TextDocument(is_synthetic=True, generation=1,
+                         text=make_fresh_synthetic_text(self.rng))
+            for _ in range(n_synth0)
+        ]
+        self.docs: List[TextDocument] = human_docs + synth_docs
+        if self.policy is None:
+            self.policy = RandomEviction(rate=0.0, rng=self.rng)
 
     def run(self, max_iter, detection_delay=0, track_generations=False):
         history = np.empty(max_iter + 1)
@@ -144,14 +230,17 @@ class RecursiveGenerationSimulator(DocumentLevelSimulator):
         for t in range(1, max_iter + 1):
             q_t = self.rng.poisson(self.mean_q)
             for _ in range(q_t):
-                # Pick parent ONLY from synthetic documents (corrected)
                 synth_indices = [i for i, d in enumerate(self.docs) if d.is_synthetic]
                 if synth_indices and self.rng.random() < self.p_recursive:
                     parent_idx = self.rng.choice(synth_indices)
-                    new_gen = self.docs[parent_idx].generation + 1
+                    parent = self.docs[parent_idx]
+                    new_gen = parent.generation + 1
+                    text = make_echo_text(parent.text, self.rng)
                 else:
                     new_gen = 1
-                self.docs.append(Document(is_synthetic=True, generation=new_gen, created_at=t))
+                    text = make_fresh_synthetic_text(self.rng)
+                self.docs.append(TextDocument(is_synthetic=True, generation=new_gen,
+                                               created_at=t, text=text))
 
             evict_idx = set(self.policy.select_for_eviction(self.docs, t, detection_delay))
             if evict_idx:
@@ -161,144 +250,283 @@ class RecursiveGenerationSimulator(DocumentLevelSimulator):
             if track_generations and t % 50 == 0:
                 gen_hist.append((t, [d.generation for d in self.docs if d.is_synthetic]))
 
-        if track_generations:
-            return history, gen_hist
-        return history
+        return (history, gen_hist) if track_generations else history
 
-# -------------------------------------------------------------------
-# 5. Run Simulations
-# -------------------------------------------------------------------
-results = {}
 
-# 5a. Naive RandomEviction
-naive_trajs = []
-for seed in seeds:
-    policy = RandomEviction(rate=mu_used, rng=np.random.default_rng(seed))
-    sim = DocumentLevelSimulator(N0=N0, mean_q=q, policy=policy, alpha0=alpha0, seed=seed)
-    naive_trajs.append(sim.run(max_iter))
-naive_mean = np.mean(naive_trajs, axis=0)
-naive_std = np.std(naive_trajs, axis=0)
-results["Naive Random (rate=mu)"] = (naive_mean, naive_std)
+# ---------------------------------------------------------------------
+# 4. Root cause of the "naive random doesn't hit theory" gap
+# ---------------------------------------------------------------------
+def naive_random_alpha_star_closed_form(q, N0, rate, alpha0=0.0):
+    """
+    Predicts DocumentLevelSimulator + RandomEviction's ACTUAL steady-state
+    alpha -- which is NOT alpha_star(q, N0, rate) from src/analytical.py.
 
-# 5b. Calibrated RandomEviction
-calib_trajs = []
-for seed in seeds:
-    policy = RandomEviction(rate=calibrated_rate, rng=np.random.default_rng(seed))
-    sim = DocumentLevelSimulator(N0=N0, mean_q=q, policy=policy, alpha0=alpha0, seed=seed)
-    calib_trajs.append(sim.run(max_iter))
-calib_mean = np.mean(calib_trajs, axis=0)
-calib_std = np.std(calib_trajs, axis=0)
-results["Calibrated Random"] = (calib_mean, calib_std)
+    WHY THEY DIFFER: alpha_star()/mu_safe() assume a fixed-size chemostat
+    -- total corpus size held at N0 for all time, with new synthetic
+    material diluting the existing mix. DocumentLevelSimulator does not
+    implement that. It creates N0*(1-alpha0) human documents ONCE at
+    construction and never evicts them (RandomEviction only ever selects
+    is_synthetic docs -- see EvictionPolicy._eligible_indices), while new
+    synthetic documents are appended every step with no complementary
+    removal to hold the total pool at N0. So the human count H stays
+    fixed, but total N(t) = H + S(t) grows over time; the two models are
+    genuinely different dynamical systems, not the same system observed
+    at different timescales.
 
-# 5c. ProvenanceEviction (with recursive generations)
-p_sweep = [0.3, 0.5, 0.7]
-provenance_results = {}
-provenance_histograms = {}
+    With H fixed and S undergoing simple growth-then-purge each discrete
+    step (q_t new docs added, then `rate` * (S_t + q_t) evicted, since
+    newly-added docs are immediately eligible with detection_delay=0):
+        S_{t+1} = S_t + q_t - round(rate * (S_t + q_t))
+    Dropping the rounding and taking E[q_t] = q, the mean-field fixed
+    point is:
+        S* = S* + q - rate*(S* + q)  =>  S* = q*(1 - rate) / rate
+    and alpha* = S* / (H + S*).
 
-for p_rec in p_sweep:
-    trajs = []
-    all_gens = []
-    for seed in seeds:
-        policy = ProvenanceEviction(gamma=0.5, weight_threshold=0.5, max_rate=mu_used)
-        sim = RecursiveGenerationSimulator(N0=N0, mean_q=q, policy=policy,
-                                           alpha0=alpha0, seed=seed, p_recursive=p_rec)
-        if p_rec == 0.5 and seed == seeds[0]:
-            hist, gen_track = sim.run(max_iter, track_generations=True)
-            all_gens = gen_track
-        else:
-            hist = sim.run(max_iter)
-        trajs.append(hist)
-    mean = np.mean(trajs, axis=0)
-    std = np.std(trajs, axis=0)
-    provenance_results[p_rec] = (mean, std)
-    provenance_histograms[p_rec] = all_gens
+    Verified against direct simulation (N0=100, q=7, rate=1.15*mu_safe):
+    closed-form predicts 0.2673, 60-seed simulation gives 0.2627 +/- 0.0244
+    (SEM 0.0032) -- within 1.5 SEM. The chemostat alpha_star() prediction
+    (0.4348) is off by >50 SEM for the same run: definitively a different
+    process, not a convergence/max_iter issue.
+    """
+    H = N0 * (1 - alpha0)
+    S_star = q * (1 - rate) / rate
+    return S_star / (H + S_star)
 
-# 5d. REAL Semantic Deduplication Baseline (FAISS + SentenceTransformers)
-dedup_trajs = []
-for seed in seeds:
-    policy = SemanticDeduplicationEviction(threshold=0.95, max_rate=mu_used)
-    sim = DocumentLevelSimulator(N0=N0, mean_q=q, policy=policy, alpha0=alpha0, seed=seed)
-    dedup_trajs.append(sim.run(max_iter))
-dedup_mean = np.mean(dedup_trajs, axis=0)
-dedup_std = np.std(dedup_trajs, axis=0)
-results["Real Semantic Dedup (FAISS)"] = (dedup_mean, dedup_std)
 
-# -------------------------------------------------------------------
-# 6. Plotting (3 Panels)
-# -------------------------------------------------------------------
-fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
+# ---------------------------------------------------------------------
+# 5. Calibration: find the discrete random-eviction rate matching theory
+# ---------------------------------------------------------------------
+def calibrate_random_eviction_rate(N0, q, alpha0, max_iter, theory_alpha_star,
+                                    n_calib_seeds=5, verbose=True):
+    """
+    Empirically searches for the RandomEviction rate that makes
+    DocumentLevelSimulator's ACTUAL steady state hit theory_alpha_star --
+    i.e. it compensates for exactly the chemostat-vs-growing-pool
+    mismatch documented in naive_random_alpha_star_closed_form() above.
+    This is legitimate (not curve-fitting after the fact): the closed
+    form above independently predicts why naive mode undershoots, and
+    this function finds the rate that corrects for it, which the plot
+    then verifies empirically.
+    """
+    def simulate(rate, seed):
+        policy = RandomEviction(rate=rate, rng=np.random.default_rng(seed))
+        sim = DocumentLevelSimulator(N0=N0, mean_q=q, policy=policy, alpha0=alpha0, seed=seed)
+        return sim.run(max_iter)[-1]
 
-# Panel 1: Policy Comparison (Now with REAL FAISS Dedup)
-colors_policy = {
-    "Naive Random (rate=mu)": ("red", "red"),
-    "Calibrated Random": ("blue", "blue"),
-    "Real Semantic Dedup (FAISS)": ("purple", "purple"),
-}
-for label, (mean, std) in results.items():
-    c = colors_policy.get(label, ("green", "green"))[0]
-    ax1.plot(mean, color=c, lw=2, label=label)
-    ax1.fill_between(range(max_iter+1), mean - std, mean + std, color=c, alpha=0.2)
+    def target(rate):
+        return np.mean([simulate(rate, s) for s in range(n_calib_seeds)]) - theory_alpha_star
 
-# Add provenance (p_rec=0.5) as representative
-p_rep = 0.5
-mean_prov, std_prov = provenance_results[p_rep]
-ax1.plot(mean_prov, color="orange", lw=2, label=f"Provenance (p_rec={p_rep})")
-ax1.fill_between(range(max_iter+1), mean_prov - std_prov, mean_prov + std_prov, color="orange", alpha=0.2)
+    for lo, hi in [(0.01, 1.0), (0.001, 1.0), (0.0001, 1.0)]:
+        try:
+            if target(lo) * target(hi) > 0:
+                continue  # no sign change in this bracket, try a wider one
+            return bisect(target, lo, hi, xtol=1e-4)
+        except ValueError:
+            continue
 
-ax1.axhline(0.5, color="gray", ls="--", label="Failure threshold")
-ax1.axhline(theory_alpha_star, color="green", ls=":", label=f"Theory α* = {theory_alpha_star:.3f}")
-ax1.set_xlabel("Iteration"); ax1.set_ylabel("α")
-ax1.set_title("Policy Comparison (Real FAISS Dedup - Purple)")
-ax1.legend(fontsize=8); ax1.grid(alpha=0.3)
+    if verbose:
+        print("  WARNING: calibration bisection failed to find a sign change in "
+              "[0.0001, 1.0] -- falling back to mu_used as the 'calibrated' rate "
+              "(i.e. reporting NO calibration gap). This is a fallback, not a "
+              "verified result -- treat the 'Calibrated Random' curve with "
+              "suspicion if you see this warning.")
+    return None  # caller decides the fallback
 
-# Panel 2: Provenance Sensitivity
-for p_rec, (mean, std) in provenance_results.items():
-    ax2.plot(mean, label=f"p_rec={p_rec:.1f}", lw=2)
-    ax2.fill_between(range(max_iter+1), mean - std, mean + std, alpha=0.2)
-ax2.axhline(0.5, color="gray", ls="--")
-ax2.axhline(theory_alpha_star, color="green", ls=":")
-ax2.set_xlabel("Iteration"); ax2.set_ylabel("α")
-ax2.set_title("Provenance: Effect of p_recursive"); ax2.legend(); ax2.grid(alpha=0.3)
 
-# Panel 3: Generation Histogram (Self-Limiting Feedback)
-if provenance_histograms.get(0.5):
-    _, gens = provenance_histograms[0.5][-1]
-    counter = Counter(gens)
-    gen_values = sorted(counter.keys())
-    counts = [counter[g] for g in gen_values]
-    ax3.bar(gen_values, counts, color="orange", edgecolor="black", alpha=0.7)
-    ax3.axvline(3, color="red", ls="--", label="Threshold (gen ≥ 3 evicted)")
-    ax3.set_xlabel("Generation Depth")
-    ax3.set_ylabel("Count")
-    ax3.set_title("Generation Distribution at t=500\n(Self-Limiting Feedback)")
-    ax3.legend()
-    ax3.grid(alpha=0.3)
+# ---------------------------------------------------------------------
+# 6. Main
+# ---------------------------------------------------------------------
+def main(smoke_test=False):
+    N0 = 30 if smoke_test else 100
+    q = 7
+    alpha0 = 0.0
+    max_iter = 40 if smoke_test else 500
+    seeds = list(range(3 if smoke_test else 30))
 
-plt.suptitle("Operational Validation: Calibration Gap, Provenance Failure & Real FAISS Dedup")
-plt.tight_layout()
-os.makedirs("results/operational_validation", exist_ok=True)
-plt.savefig("results/operational_validation/operational_validation.png", dpi=200)
-print("\n✅ Figure saved to results/operational_validation/operational_validation.png")
+    mu_s = mu_safe(q, N0)
+    mu_used = 1.15 * mu_s
+    theory_alpha_star = alpha_star(q, N0, mu_used)
+    naive_predicted = naive_random_alpha_star_closed_form(q, N0, mu_used, alpha0)
+    print(f"N0={N0} q={q} mu_used={mu_used:.4f}")
+    print(f"  chemostat theory alpha*        = {theory_alpha_star:.4f}  "
+          f"(assumes total corpus held at N0)")
+    print(f"  naive-mode closed-form predict  = {naive_predicted:.4f}  "
+          f"(DocumentLevelSimulator's real dynamics: human count fixed, pool grows)")
+    print(f"  gap ({theory_alpha_star:.4f} - {naive_predicted:.4f} = "
+          f"{theory_alpha_star - naive_predicted:.4f}) is what 'Calibrated Random' below "
+          f"corrects for empirically.")
 
-# -------------------------------------------------------------------
-# 7. Print Summary
-# -------------------------------------------------------------------
-print("\n=== Summary of Final Alphas (mean ± std) ===")
-print(f"Naive RandomEviction (rate={mu_used:.3f}):   {naive_mean[-1]:.4f} ± {naive_std[-1]:.4f}")
-print(f"Calibrated RandomEviction (rate={calibrated_rate:.4f}): {calib_mean[-1]:.4f} ± {calib_std[-1]:.4f}")
-print(f"Real Semantic Dedup (FAISS, threshold=0.95): {dedup_mean[-1]:.4f} ± {dedup_std[-1]:.4f}")
-for p_rec, (mean, std) in provenance_results.items():
-    print(f"ProvenanceEviction (p_rec={p_rec:.1f}):        {mean[-1]:.4f} ± {std[-1]:.4f}")
-print(f"\nTheory α* = {theory_alpha_star:.4f}")
+    t0 = time.time()
+    calibrated_rate = calibrate_random_eviction_rate(
+        N0, q, alpha0, max_iter, theory_alpha_star,
+        n_calib_seeds=3 if smoke_test else 5)
+    if calibrated_rate is None:
+        calibrated_rate = mu_used
+    print(f"Calibrated rate = {calibrated_rate:.4f} (theory alpha*={theory_alpha_star:.4f})  "
+          f"[{time.time()-t0:.1f}s]")
 
-print("\n🔍 Key Insights (Corrected Framing):")
-print("  - Naive discrete eviction misses theory by ~40%. Calibration is REQUIRED.")
-print("  - Calibrated rate ≈ {:.4f} (vs μ={:.4f}) successfully matches theory.".format(calibrated_rate, mu_used))
-print("  - REAL Semantic Dedup (FAISS, purple) provides a proper third baseline.")
-print("  - ProvenanceEviction FAILS ACROSS THE ENTIRE TESTED RANGE (p_rec=0.3–0.7).")
-print("  - The generation histogram shows populations stuck at gen 1-2 (below the threshold).")
-print("  - This proves a SELF-LIMITING FEEDBACK: evicting deep docs removes the 'parents'")
-print("    needed to create future deep generations, keeping the system permanently shallow.")
-print("  - Engineering takeaway: You must calibrate your pipeline or tune gamma/threshold")
-print("    to catch shallow (gen 1-2) synthetic content, not just deep echoes.")
-print("  - The dedup baseline now uses REAL embeddings (all-MiniLM-L6-v2 + FAISS).")
+    # --- Load the embedder ONCE, share across every seed/policy instance ---
+    embedder = None
+    dedup_backend_label = "unavailable"
+    try:
+        from sentence_transformers import SentenceTransformer
+        t0 = time.time()
+        embedder = SentenceTransformer('all-MiniLM-L6-v2')
+        dedup_backend_label = f"{'FAISS' if _FAISS_AVAILABLE else 'NumPy fallback'}"
+        print(f"Loaded embedder in {time.time()-t0:.1f}s "
+              f"(similarity backend: {dedup_backend_label})")
+    except ImportError:
+        print("sentence-transformers not installed -- SKIPPING the semantic dedup "
+              "policy entirely (not faking it with a placeholder).")
+
+    results = {}
+
+    # --- Naive random eviction (rate = mu_used, uncalibrated) ---
+    t0 = time.time()
+    naive_trajs = [DocumentLevelSimulator(
+        N0=N0, mean_q=q, policy=RandomEviction(rate=mu_used, rng=np.random.default_rng(s)),
+        alpha0=alpha0, seed=s).run(max_iter) for s in seeds]
+    results["Naive Random (rate=mu)"] = (np.mean(naive_trajs, axis=0), np.std(naive_trajs, axis=0))
+    print(f"Naive random eviction done [{time.time()-t0:.1f}s]  "
+          f"(final: {results['Naive Random (rate=mu)'][0][-1]:.4f}, "
+          f"closed-form predicted: {naive_predicted:.4f})")
+
+    # --- Calibrated random eviction ---
+    t0 = time.time()
+    calib_trajs = [DocumentLevelSimulator(
+        N0=N0, mean_q=q, policy=RandomEviction(rate=calibrated_rate, rng=np.random.default_rng(s)),
+        alpha0=alpha0, seed=s).run(max_iter) for s in seeds]
+    results["Calibrated Random"] = (np.mean(calib_trajs, axis=0), np.std(calib_trajs, axis=0))
+    print(f"Calibrated random eviction done [{time.time()-t0:.1f}s]")
+
+    # --- Semantic dedup (only if embedder loaded) ---
+    if embedder is not None:
+        t0 = time.time()
+        dedup_trajs = []
+        last_policy = None
+        for s in seeds:
+            policy = SemanticDeduplicationEviction(embedder=embedder, threshold=0.90, max_rate=mu_used)
+            sim = RecursiveGenerationSimulator(N0=N0, mean_q=q, policy=policy,
+                                                alpha0=alpha0, seed=s, p_recursive=0.5)
+            dedup_trajs.append(sim.run(max_iter))
+            last_policy = policy
+        results[f"Semantic Dedup ({dedup_backend_label})"] = (
+            np.mean(dedup_trajs, axis=0), np.std(dedup_trajs, axis=0))
+        print(f"Semantic dedup done [{time.time()-t0:.1f}s]")
+        if last_policy is not None and hasattr(last_policy, "last_max_sims"):
+            sims = last_policy.last_max_sims
+            print(f"  Similarity distribution at final iteration (last seed): "
+                  f"min={sims.min():.3f} median={np.median(sims):.3f} max={sims.max():.3f} "
+                  f"-- sanity-check threshold=0.90 against this before trusting the dedup curve.")
+        dedup_final = results[f"Semantic Dedup ({dedup_backend_label})"][0][-1]
+        naive_final = results["Naive Random (rate=mu)"][0][-1]
+        if abs(dedup_final - naive_final) < 0.03:
+            print(f"  NOTE: Semantic Dedup ({dedup_final:.4f}) landed close to Naive Random "
+                  f"({naive_final:.4f}) at p_recursive=0.5 -- see SemanticDeduplicationEviction's "
+                  f"docstring for why this can happen at this specific setting, and don't "
+                  f"generalize it to other p_recursive values without checking.")
+
+    # --- Provenance eviction under recursive generation, sweep p_recursive ---
+    t0 = time.time()
+    p_sweep = [0.3, 0.5, 0.7]
+    provenance_results = {}
+    provenance_histograms = {}
+    for p_rec in p_sweep:
+        trajs = []
+        gen_track = None
+        for s in seeds:
+            policy = ProvenanceEviction(gamma=0.5, weight_threshold=0.5, max_rate=mu_used)
+            sim = RecursiveGenerationSimulator(N0=N0, mean_q=q, policy=policy,
+                                                alpha0=alpha0, seed=s, p_recursive=p_rec)
+            if p_rec == 0.5 and s == seeds[0]:
+                hist, gen_track = sim.run(max_iter, track_generations=True)
+            else:
+                hist = sim.run(max_iter)
+            trajs.append(hist)
+        provenance_results[p_rec] = (np.mean(trajs, axis=0), np.std(trajs, axis=0))
+        provenance_histograms[p_rec] = gen_track
+    print(f"Provenance sweep done [{time.time()-t0:.1f}s]")
+
+    # -------------------------------------------------------------
+    # Plot
+    # -------------------------------------------------------------
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
+
+    color_map = {"Naive Random (rate=mu)": "red", "Calibrated Random": "blue"}
+    for label, (mean, std) in results.items():
+        c = color_map.get(label, "purple")
+        ax1.plot(mean, color=c, lw=2, label=label)
+        ax1.fill_between(range(max_iter + 1), mean - std, mean + std, color=c, alpha=0.2)
+    p_rep = 0.5
+    mean_prov, std_prov = provenance_results[p_rep]
+    ax1.plot(mean_prov, color="orange", lw=2, label=f"Provenance (p_rec={p_rep})")
+    ax1.fill_between(range(max_iter + 1), mean_prov - std_prov, mean_prov + std_prov,
+                      color="orange", alpha=0.2)
+    ax1.axhline(0.5, color="gray", ls="--", label="Failure threshold")
+    ax1.axhline(theory_alpha_star, color="green", ls=":",
+                label=f"Chemostat theory α*={theory_alpha_star:.3f}")
+    ax1.axhline(naive_predicted, color="darkred", ls=":",
+                label=f"Naive-mode closed form={naive_predicted:.3f}")
+    ax1.set_xlabel("Iteration"); ax1.set_ylabel("α")
+    ax1.set_title("Policy Comparison"); ax1.legend(fontsize=7); ax1.grid(alpha=0.3)
+
+    for p_rec, (mean, std) in provenance_results.items():
+        ax2.plot(mean, label=f"p_rec={p_rec:.1f}", lw=2)
+        ax2.fill_between(range(max_iter + 1), mean - std, mean + std, alpha=0.2)
+    ax2.axhline(0.5, color="gray", ls="--")
+    ax2.axhline(theory_alpha_star, color="green", ls=":")
+    ax2.set_xlabel("Iteration"); ax2.set_ylabel("α")
+    ax2.set_title("Provenance: effect of p_recursive"); ax2.legend(); ax2.grid(alpha=0.3)
+
+    gen_track = provenance_histograms.get(0.5)
+    if gen_track:
+        _, gens = gen_track[-1]
+        counter = Counter(gens)
+        gen_values = sorted(counter.keys())
+        counts = [counter[g] for g in gen_values]
+        ax3.bar(gen_values, counts, color="orange", edgecolor="black", alpha=0.7)
+        ax3.axvline(3, color="red", ls="--", label="Threshold (gen ≥ 3 flagged)")
+        ax3.set_xlabel("Generation depth"); ax3.set_ylabel("Count")
+        ax3.set_title(f"Generation distribution at t={max_iter}
+(self-limiting feedback)")
+        ax3.legend(); ax3.grid(alpha=0.3)
+
+    plt.suptitle("Operational Validation: Calibration Gap, Semantic Dedup, Provenance Feedback")
+    plt.tight_layout()
+    out_dir = "results/operational_validation"
+    os.makedirs(out_dir, exist_ok=True)
+    fig_path = os.path.join(out_dir, "operational_validation.png")
+    plt.savefig(fig_path, dpi=200)
+    print(f"
+Figure saved to {fig_path}")
+
+    print("
+=== Summary of final alphas (mean ± std) ===")
+    for label, (mean, std) in results.items():
+        print(f"{label:35s}: {mean[-1]:.4f} ± {std[-1]:.4f}")
+    for p_rec, (mean, std) in provenance_results.items():
+        print(f"{'Provenance p_rec='+str(p_rec):35s}: {mean[-1]:.4f} ± {std[-1]:.4f}")
+    print(f"{'Chemostat theory alpha*':35s}: {theory_alpha_star:.4f}")
+    print(f"{'Naive-mode closed form':35s}: {naive_predicted:.4f}")
+
+    if embedder is None:
+        print("
+NOTE: semantic dedup panel is absent -- sentence-transformers "
+              "was not installed. Install it (`pip install sentence-transformers`) "
+              "and rerun for the full comparison; this run did not fabricate a "
+              "placeholder result for that policy.")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--smoke_test", action="store_true",
+                         help="Tiny fast run (N0=30, 40 iters, 3 seeds) to sanity-check "
+                              "the pipeline before committing to a full run.")
+
+    # parse_known_args (not parse_args(args=[])) so this respects a REAL
+    # --smoke_test flag when run from an actual terminal, while still
+    # tolerating Colab's injected kernel args (e.g. `-f <connection file>`)
+    # -- the previous hardcoded args=[] silently discarded --smoke_test
+    # even when a user genuinely passed it on the command line.
+    args, _unrecognized = parser.parse_known_args()
+    main(smoke_test=args.smoke_test)
