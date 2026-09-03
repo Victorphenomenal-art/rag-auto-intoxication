@@ -20,7 +20,15 @@ import matplotlib.pyplot as plt
 import yaml
 from scipy.stats import ttest_1samp
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+except NameError:
+    # __file__ isn't defined when this code runs from a notebook cell
+    # (pasted directly, or via exec()) rather than as an actual script
+    # file -- fall back to the current working directory, which is the
+    # repo root if you've already `%cd`'d into it (as Cell 1 does).
+    _repo_root = os.getcwd()
+sys.path.insert(0, _repo_root)
 from src.analytical import (
     alpha_uncorrected, alpha_corrected_exact, mu_bifurcation, mu_safe, alpha_star, half_life_exact,
 )
@@ -62,6 +70,12 @@ def main(config_path):
 
         colors = ["#f4a300", "#2a9d8f", "#264653"]
         for mu_mult, c in zip(mu_multipliers, colors):
+            # NOTE: multipliers in configs/phase_transition.yaml are relative
+            # to mu_safe (2q/N0), NOT mu_bifurcation (q/N0). A multiplier of
+            # 0.85 is therefore still ABOVE the bifurcation point (0.85 > 0.5
+            # in units of mu_bifurcation), so the system is dynamically
+            # stable there -- it just fails the alpha*<0.5 safety target.
+            # See README.md "What's proven here" for the full explanation.
             mu_val = mu_mult * mu_s
             hist_corr = run_multi_seed(N0, q, mu=mu_val, alpha0=alpha0, max_iter=max_iter, seeds=seeds)
             mean_corr, std_corr = hist_corr.mean(axis=0), hist_corr.std(axis=0)
@@ -77,11 +91,9 @@ def main(config_path):
             t_stat, p_val = ttest_1samp(final_corr, 0.5, alternative="less")
             summary_rows.append({
                 "N0": N0, "q": q, "mu_multiplier": mu_mult, "mu": mu_val,
-                "mu_bifurcation": mu_b, "mu_safe": mu_s,
-                "dynamically_stable": stabilizes,
+                "mu_bifurcation": mu_b, "mu_safe": mu_s, "dynamically_stable": stabilizes,
                 "alpha_star_theory": a_star,
-                "final_alpha_stoch_mean": mean_corr[-1],
-                "final_alpha_stoch_std": std_corr[-1],
+                "final_alpha_stoch_mean": mean_corr[-1], "final_alpha_stoch_std": std_corr[-1],
                 "final_alpha_exact": exact_corr[-1],
                 "p_value_below_0.5": p_val,
             })
@@ -91,7 +103,7 @@ def main(config_path):
         ax.set_xlabel("Iteration")
         if idx == 0:
             ax.set_ylabel("Synthetic fraction α")
-        ax.legend(fontsize=6.5, loc="center right")
+        plt.rcParams.update({'font.size': 12, 'legend.fontsize': 10})
         ax.set_ylim(-0.02, 1.05)
 
     plt.suptitle(f"Phase Transition: N0={N0_list}, q={q}, {len(seeds)} seeds, {max_iter} iterations")
@@ -112,5 +124,8 @@ def main(config_path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/phase_transition.yaml")
-    args = parser.parse_args()
+    # parse_known_args, not parse_args -- see run_scale_benchmark.py for
+    # why: avoids SystemExit(2) when this runs inside a Colab/Jupyter
+    # kernel directly instead of via `!python script.py`.
+    args, _unrecognized = parser.parse_known_args()
     main(args.config)
